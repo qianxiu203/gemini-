@@ -48,13 +48,33 @@ export class LoadBalancer extends DurableObject {
 			);
 			CREATE TABLE IF NOT EXISTS api_key_statuses (
 				api_key TEXT PRIMARY KEY,
-				status TEXT CHECK(status IN ('normal', 'abnormal')) NOT NULL DEFAULT 'normal',
+				status TEXT CHECK(status IN ('normal', 'abnormal', 'pending_deletion')) NOT NULL DEFAULT 'normal',
 				last_checked_at INTEGER,
 				failed_count INTEGER NOT NULL DEFAULT 0,
 				key_group TEXT CHECK(key_group IN ('normal', 'abnormal')) NOT NULL DEFAULT 'normal',
+				pending_deletion_reason TEXT,
+				pending_deletion_at INTEGER,
 				FOREIGN KEY(api_key) REFERENCES api_keys(api_key) ON DELETE CASCADE
 			);
 		`);
+		
+		// Check if the new columns exist, if not add them
+		try {
+			// Check if pending_deletion_reason column exists
+			this.ctx.storage.sql.exec("SELECT pending_deletion_reason FROM api_key_statuses LIMIT 1");
+		} catch (e) {
+			// Column doesn't exist, add it
+			this.ctx.storage.sql.exec("ALTER TABLE api_key_statuses ADD COLUMN pending_deletion_reason TEXT");
+		}
+		
+		try {
+			// Check if pending_deletion_at column exists
+			this.ctx.storage.sql.exec("SELECT pending_deletion_at FROM api_key_statuses LIMIT 1");
+		} catch (e) {
+			// Column doesn't exist, add it
+			this.ctx.storage.sql.exec("ALTER TABLE api_key_statuses ADD COLUMN pending_deletion_at INTEGER");
+		}
+		
 		this.ctx.storage.setAlarm(Date.now() + 5 * 60 * 1000); // Set an alarm to run in 5 minutes
 	}
 
@@ -89,8 +109,14 @@ export class LoadBalancer extends DurableObject {
 					// Still getting 429, increment failed_count
 					const newFailedCount = failedCount + 1;
 					if (newFailedCount >= 5) {
-						// Delete the key if it has failed 5 times
-						await this.ctx.storage.sql.exec('DELETE FROM api_keys WHERE api_key = ?', apiKey);
+						// Move to pending deletion instead of deleting immediately
+						await this.ctx.storage.sql.exec(
+							"UPDATE api_key_statuses SET status = 'pending_deletion', pending_deletion_reason = '连续5次失败', pending_deletion_at = ?, last_checked_at = ? WHERE api_key = ?",
+							Date.now(),
+							Date.now(),
+							apiKey
+						);
+						console.log(`API key ${apiKey} moved to pending deletion due to 5 consecutive failures.`);
 					} else {
 						await this.ctx.storage.sql.exec(
 							'UPDATE api_key_statuses SET failed_count = ?, last_checked_at = ? WHERE api_key = ?',
@@ -162,7 +188,7 @@ export class LoadBalancer extends DurableObject {
 		}
 
 		// 管理 API 权限校验（使用 HOME_ACCESS_KEY）
-		if (pathname === '/api/keys' || pathname === '/api/keys/check') {
+		if (pathname === '/api/keys' || pathname === '/api/keys/check' || pathname === '/api/keys/pending' || pathname === '/api/keys/confirm-delete' || pathname === '/api/keys/restore') {
 			if (!isAdminAuthenticated(request, this.env.HOME_ACCESS_KEY)) {
 				return new Response(JSON.stringify({ error: 'Unauthorized' }), {
 					status: 401,
@@ -180,6 +206,15 @@ export class LoadBalancer extends DurableObject {
 			}
 			if (pathname === '/api/keys/check' && request.method === 'POST') {
 				return this.handleApiKeysCheck(request);
+			}
+			if (pathname === '/api/keys/pending' && request.method === 'GET') {
+				return this.getPendingDeletionKeys(request);
+			}
+			if (pathname === '/api/keys/confirm-delete' && request.method === 'POST') {
+				return this.confirmDeleteKeys(request);
+			}
+			if (pathname === '/api/keys/restore' && request.method === 'POST') {
+				return this.restoreKeys(request);
 			}
 		}
 
@@ -290,6 +325,116 @@ export class LoadBalancer extends DurableObject {
 			return new Response('Internal Server Error\n' + error, {
 				status: 500,
 				headers: { 'Content-Type': 'text/plain' },
+			});
+		}
+	}
+
+	// 获取待删除的API密钥列表
+	async getPendingDeletionKeys(request: Request): Promise<Response> {
+		try {
+			const url = new URL(request.url);
+			const page = parseInt(url.searchParams.get('page') || '1', 10);
+			const pageSize = parseInt(url.searchParams.get('pageSize') || '50', 10);
+			const offset = (page - 1) * pageSize;
+
+			const totalResult = await this.ctx.storage.sql.exec("SELECT COUNT(*) as count FROM api_key_statuses WHERE status = 'pending_deletion'").raw<any>();
+			const totalArray = Array.from(totalResult);
+			const total = totalArray.length > 0 ? totalArray[0][0] : 0;
+
+			const results = await this.ctx.storage.sql
+				.exec("SELECT api_key, status, key_group, last_checked_at, failed_count, pending_deletion_reason, pending_deletion_at FROM api_key_statuses WHERE status = 'pending_deletion' ORDER BY pending_deletion_at DESC LIMIT ? OFFSET ?", pageSize, offset)
+				.raw<any>();
+			const keys = results
+				? Array.from(results).map((row: any) => ({
+						api_key: row[0],
+						status: row[1],
+						key_group: row[2],
+						last_checked_at: row[3],
+						failed_count: row[4],
+						pending_deletion_reason: row[5],
+						pending_deletion_at: row[6],
+				  }))
+				: [];
+
+			return new Response(JSON.stringify({ keys, total }), {
+				headers: { 'Content-Type': 'application/json' },
+			});
+		} catch (error: any) {
+			console.error('获取待删除API密钥失败:', error);
+			return new Response(JSON.stringify({ error: error.message || '内部服务器错误' }), {
+				status: 500,
+				headers: { 'Content-Type': 'application/json' },
+			});
+		}
+	}
+
+	// 确认删除API密钥
+	async confirmDeleteKeys(request: Request): Promise<Response> {
+		try {
+			const { keys } = (await request.json()) as { keys: string[] };
+			if (!Array.isArray(keys) || keys.length === 0) {
+				return new Response(JSON.stringify({ error: '请求体无效，需要一个包含key的非空数组。' }), {
+					status: 400,
+					headers: { 'Content-Type': 'application/json' },
+				});
+			}
+
+			// 只删除待删除状态的key
+			const placeholders = keys.map(() => '?').join(',');
+			const result = await this.ctx.storage.sql
+				.exec(`DELETE FROM api_keys WHERE api_key IN (${placeholders}) AND api_key IN (SELECT api_key FROM api_key_statuses WHERE status = 'pending_deletion')`, ...keys)
+				.raw<any>();
+
+			const deletedCount = Array.from(result).length;
+
+			return new Response(JSON.stringify({ 
+				message: `成功删除 ${deletedCount} 个API密钥。`,
+				deleted_count: deletedCount 
+			}), {
+				status: 200,
+				headers: { 'Content-Type': 'application/json' },
+			});
+		} catch (error: any) {
+			console.error('确认删除API密钥失败:', error);
+			return new Response(JSON.stringify({ error: error.message || '内部服务器错误' }), {
+				status: 500,
+				headers: { 'Content-Type': 'application/json' },
+			});
+		}
+	}
+
+	// 恢复API密钥
+	async restoreKeys(request: Request): Promise<Response> {
+		try {
+			const { keys } = (await request.json()) as { keys: string[] };
+			if (!Array.isArray(keys) || keys.length === 0) {
+				return new Response(JSON.stringify({ error: '请求体无效，需要一个包含key的非空数组。' }), {
+					status: 400,
+					headers: { 'Content-Type': 'application/json' },
+				});
+			}
+
+			// 恢复待删除状态的key，重置为正常状态
+			const placeholders = keys.map(() => '?').join(',');
+			const result = await this.ctx.storage.sql
+				.exec(`UPDATE api_key_statuses SET status = 'normal', key_group = 'normal', failed_count = 0, pending_deletion_reason = NULL, pending_deletion_at = NULL, last_checked_at = ? WHERE api_key IN (${placeholders}) AND status = 'pending_deletion'`, 
+				Date.now(), ...keys)
+				.raw<any>();
+
+			const restoredCount = Array.from(result).length;
+
+			return new Response(JSON.stringify({ 
+				message: `成功恢复 ${restoredCount} 个API密钥。`,
+				restored_count: restoredCount 
+			}), {
+				status: 200,
+				headers: { 'Content-Type': 'application/json' },
+			});
+		} catch (error: any) {
+			console.error('恢复API密钥失败:', error);
+			return new Response(JSON.stringify({ error: error.message || '内部服务器错误' }), {
+				status: 500,
+				headers: { 'Content-Type': 'application/json' },
 			});
 		}
 	}
@@ -987,7 +1132,7 @@ private async transformMessages(messages: any[]) {
 			const total = totalArray.length > 0 ? totalArray[0][0] : 0;
 
 			const results = await this.ctx.storage.sql
-				.exec('SELECT api_key, status, key_group, last_checked_at, failed_count FROM api_key_statuses LIMIT ? OFFSET ?', pageSize, offset)
+				.exec('SELECT api_key, status, key_group, last_checked_at, failed_count, pending_deletion_reason, pending_deletion_at FROM api_key_statuses LIMIT ? OFFSET ?', pageSize, offset)
 				.raw<any>();
 			const keys = results
 				? Array.from(results).map((row: any) => ({
@@ -996,6 +1141,8 @@ private async transformMessages(messages: any[]) {
 						key_group: row[2],
 						last_checked_at: row[3],
 						failed_count: row[4],
+						pending_deletion_reason: row[5],
+						pending_deletion_at: row[6],
 				  }))
 				: [];
 
@@ -1019,7 +1166,7 @@ private async transformMessages(messages: any[]) {
 		try {
 			// First, try to get a key from the normal group
 			let results = await this.ctx.storage.sql
-				.exec("SELECT api_key FROM api_key_statuses WHERE key_group = 'normal' ORDER BY RANDOM() LIMIT 1")
+				.exec("SELECT api_key FROM api_key_statuses WHERE key_group = 'normal' AND status != 'pending_deletion' ORDER BY RANDOM() LIMIT 1")
 				.raw<any>();
 			let keys = Array.from(results);
 			if (keys && keys.length > 0) {
@@ -1028,9 +1175,9 @@ private async transformMessages(messages: any[]) {
 				return key;
 			}
 
-			// If no keys in normal group, try the abnormal group
+			// If no keys in normal group, try the abnormal group (excluding pending deletion)
 			results = await this.ctx.storage.sql
-				.exec("SELECT api_key FROM api_key_statuses WHERE key_group = 'abnormal' ORDER BY RANDOM() LIMIT 1")
+				.exec("SELECT api_key FROM api_key_statuses WHERE key_group = 'abnormal' AND status != 'pending_deletion' ORDER BY RANDOM() LIMIT 1")
 				.raw<any>();
 			keys = Array.from(results);
 			if (keys && keys.length > 0) {

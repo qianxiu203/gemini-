@@ -178,9 +178,10 @@ export const Render = ({ isAuthenticated, showWarning }: { isAuthenticated: bool
 												</th>
 												<th class="p-4 text-slate-600 font-semibold">API 密钥</th>
 												<th class="p-4 text-slate-600 font-semibold">状态</th>
-												<th class="p-4 text-slate-600 font-semibold">分组</th>
-												<th class="p-4 text-slate-600 font-semibold">最后检查时间</th>
-												<th class="p-4 text-slate-600 font-semibold">失败次数</th>
+										<th class="p-4 text-slate-600 font-semibold">分组</th>
+										<th class="p-4 text-slate-600 font-semibold">最后检查时间</th>
+										<th class="p-4 text-slate-600 font-semibold">失败次数</th>
+										<th class="p-4 text-slate-600 font-semibold">待删除原因</th>
 											</tr>
 										</thead>
 										<tbody class="divide-y divide-slate-100"></tbody>
@@ -218,6 +219,35 @@ export const Render = ({ isAuthenticated, showWarning }: { isAuthenticated: bool
 									</svg>
 									删除选中密钥
 								</button>
+								<div class="mt-4 grid grid-cols-3 gap-4">
+									<button
+										id="view-pending-keys-btn"
+										class="px-4 py-2 bg-yellow-500 text-white rounded-xl hover:bg-yellow-600 transition-all duration-200 font-semibold"
+									>
+										<svg class="w-4 h-4 inline mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+											<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+										</svg>
+										查看待删除密钥
+									</button>
+									<button
+										id="confirm-delete-keys-btn"
+										class="px-4 py-2 bg-red-500 text-white rounded-xl hover:bg-red-600 transition-all duration-200 font-semibold"
+									>
+										<svg class="w-4 h-4 inline mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+											<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+										</svg>
+										确认删除
+									</button>
+									<button
+										id="restore-keys-btn"
+										class="px-4 py-2 bg-green-500 text-white rounded-xl hover:bg-green-600 transition-all duration-200 font-semibold"
+									>
+										<svg class="w-4 h-4 inline mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+											<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+										</svg>
+										恢复密钥
+									</button>
+								</div>
 							</div>
 						</div>
 						<div id="page-add-keys" class="hidden">
@@ -258,6 +288,9 @@ export const Render = ({ isAuthenticated, showWarning }: { isAuthenticated: bool
 										const selectAllCheckbox = document.getElementById('select-all-keys');
 										const deleteSelectedBtn = document.getElementById('delete-selected-keys-btn');
 										const checkKeysBtn = document.getElementById('check-keys-btn');
+										const viewPendingKeysBtn = document.getElementById('view-pending-keys-btn');
+										const confirmDeleteKeysBtn = document.getElementById('confirm-delete-keys-btn');
+										const restoreKeysBtn = document.getElementById('restore-keys-btn');
 										const paginationControls = document.getElementById('pagination-controls');
 										const prevPageBtn = document.getElementById('prev-page-btn');
 										const nextPageBtn = document.getElementById('next-page-btn');
@@ -320,17 +353,20 @@ export const Render = ({ isAuthenticated, showWarning }: { isAuthenticated: bool
 												    keysTableBody.innerHTML = '<tr><td colspan="7" class="p-2 text-center">暂无密钥</td></tr>';
 												  } else {
 												    keys.forEach(key => {
-												      const statusMap = { normal: '正常', abnormal: '异常' };
+												      const statusMap = { normal: '正常', abnormal: '异常', pending_deletion: '待删除' };
+												      const statusClass = key.status === 'normal' ? 'text-green-500' : 
+												                       key.status === 'abnormal' ? 'text-red-500' : 'text-yellow-500';
 												      const row = document.createElement('tr');
 												      row.className = 'hover:bg-slate-50 transition-colors';
 												      row.dataset.key = key.api_key;
 												      row.innerHTML = \`
-												        <td class="p-3 w-6"><input type="checkbox" class="key-checkbox rounded border-slate-300" data-key="\${key.api_key}" /></td>
+												        <td class="p-3 w-6"><input type="checkbox" class="key-checkbox rounded border-slate-300" data-key="\${key.api_key}" \${key.status === 'pending_deletion' ? 'disabled' : ''} /></td>
 												        <td class="p-3 font-mono text-sm text-slate-700">\${key.api_key}</td>
-												        <td class="p-3 status-cell">\${statusMap[key.status] || key.status}</td>
+												        <td class="p-3 status-cell \${statusClass}">\${statusMap[key.status] || key.status}</td>
 												        <td class="p-3">\${statusMap[key.key_group] || key.key_group}</td>
 												        <td class="p-3 text-sm text-slate-500">\${key.last_checked_at ? new Date(key.last_checked_at).toLocaleString() : 'N/A'}</td>
 												        <td class="p-3 text-center">\${key.failed_count}</td>
+												        <td class="p-3 text-sm text-yellow-600">\${key.pending_deletion_reason || '-'}</td>
 												      \`;
 												      keysTableBody.appendChild(row);
 												    });
@@ -509,6 +545,95 @@ export const Render = ({ isAuthenticated, showWarning }: { isAuthenticated: bool
 										});
 
 										refreshKeysBtn.addEventListener('click', fetchAndRenderKeys);
+
+										// 查看待删除密钥按钮事件
+										viewPendingKeysBtn.addEventListener('click', async () => {
+											try {
+												const response = await fetch('/api/keys/pending');
+												const result = await response.json();
+												if (response.ok) {
+													if (result.keys.length === 0) {
+														alert('当前没有待删除的密钥。');
+														return;
+													}
+													
+													let message = '待删除密钥列表:\\n\\n';
+													result.keys.forEach(key => {
+														message += '密钥: ' + key.api_key.substring(0, 16) + '...\\n';
+														message += '原因: ' + (key.pending_deletion_reason || '未知') + '\\n';
+														message += '时间: ' + (key.pending_deletion_at ? new Date(key.pending_deletion_at).toLocaleString() : '未知') + '\\n';
+														message += '失败次数: ' + key.failed_count + '\\n\\n';
+													});
+													
+													alert(message);
+												} else {
+													alert('获取待删除密钥失败: ' + (result.error || '未知错误'));
+												}
+											} catch (error) {
+												alert('请求失败，请检查网络连接。');
+												console.error('Failed to fetch pending keys:', error);
+											}
+										});
+
+										// 确认删除按钮事件
+										confirmDeleteKeysBtn.addEventListener('click', async () => {
+											try {
+												const response = await fetch('/api/keys/pending');
+												const result = await response.json();
+												if (response.ok && result.keys.length > 0) {
+													if (confirm('确定要删除所有待删除状态的密钥吗？此操作不可恢复。')) {
+														const deleteResponse = await fetch('/api/keys/confirm-delete', {
+															method: 'POST',
+															headers: {
+																'Content-Type': 'application/json'
+															}
+														});
+														const deleteResult = await deleteResponse.json();
+														if (deleteResponse.ok) {
+															alert('成功删除 ' + deleteResult.deletedCount + ' 个密钥。');
+															fetchAndRenderKeys();
+														} else {
+															alert('删除密钥失败: ' + (deleteResult.error || '未知错误'));
+														}
+													}
+												} else {
+													alert('当前没有待删除的密钥。');
+												}
+											} catch (error) {
+												alert('请求失败，请检查网络连接。');
+												console.error('Failed to confirm delete keys:', error);
+											}
+										});
+
+										// 恢复密钥按钮事件
+										restoreKeysBtn.addEventListener('click', async () => {
+											try {
+												const response = await fetch('/api/keys/pending');
+												const result = await response.json();
+												if (response.ok && result.keys.length > 0) {
+													if (confirm('确定要恢复所有待删除状态的密钥吗？')) {
+														const restoreResponse = await fetch('/api/keys/restore', {
+															method: 'POST',
+															headers: {
+																'Content-Type': 'application/json'
+															}
+														});
+														const restoreResult = await restoreResponse.json();
+														if (restoreResponse.ok) {
+															alert('成功恢复 ' + restoreResult.restoredCount + ' 个密钥。');
+															fetchAndRenderKeys();
+														} else {
+															alert('恢复密钥失败: ' + (restoreResult.error || '未知错误'));
+														}
+													}
+												} else {
+													alert('当前没有待删除的密钥。');
+												}
+											} catch (error) {
+												alert('请求失败，请检查网络连接。');
+												console.error('Failed to restore keys:', error);
+											}
+										});
 
 										prevPageBtn.addEventListener('click', () => {
 												if (currentPage > 1) {
